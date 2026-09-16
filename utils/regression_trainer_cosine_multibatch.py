@@ -15,6 +15,8 @@ from datasets.crowd import Crowd
 from losses.bay_loss import Bay_Loss
 from losses.post_prob import Post_Prob
 from math import ceil
+from utils.progress import progress_bar
+from utils.reproducibility import seed_worker
 
 
 def train_collate(batch):
@@ -53,6 +55,15 @@ class RegTrainer(Trainer):
 
         from models.lora import build_training_model
         self.model, self.model_config, checkpoint = build_training_model(args)
+        is_lora = bool(self.model_config.get('lora'))
+        self.stage = 'LoRA' if is_lora else 'Pretrain'
+        self.max_epoch = args.lora_epochs if is_lora else args.pretrain_epochs
+        self.val_interval = args.lora_val_epoch if is_lora else args.pretrain_val_epoch
+        self.val_start = args.lora_val_start if is_lora else args.pretrain_val_start
+        learning_rate = args.lr if is_lora else args.pretrain_lr
+        weight_decay = args.weight_decay if is_lora else args.pretrain_weight_decay
+        logging.info('%s schedule: epochs=%d, val_interval=%d, val_start=%d, seed=%d',
+                     self.stage, self.max_epoch, self.val_interval, self.val_start, args.seed)
         self.downsample_ratio = args.downsample_ratio
         data_dirs = resolve_data_dirs(args, self.model_config)
         logging.info('Dataset stage: %s', 'LoRA' if self.model_config.get('lora') else 'clean pretrain')
@@ -72,12 +83,14 @@ class RegTrainer(Trainer):
                                           batch_size=(args.batch_size
                                           if x == 'train' else 1),
                                           shuffle=(True if x == 'train' else False),
+                                          worker_init_fn=seed_worker,
+                                          generator=torch.Generator().manual_seed(args.seed + (x == 'val')),
                                           num_workers=args.num_workers*self.device_count,
                                           pin_memory=(True if x == 'train' else False))
                             for x in ['train', 'val']}
         self.model.to(self.device)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = optim.Adam(trainable, lr=args.lr, weight_decay=args.weight_decay)
+        self.optimizer = optim.Adam(trainable, lr=learning_rate, weight_decay=weight_decay)
         logging.info('Trainable parameters: %d / %d; model config: %s',
                      sum(p.numel() for p in trainable),
                      sum(p.numel() for p in self.model.parameters()), self.model_config)
@@ -86,6 +99,8 @@ class RegTrainer(Trainer):
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.start_epoch = checkpoint['epoch'] + 1
 
+        logging.info('Optimizer groups (effective lr, weight_decay): %s',
+                     [(g['lr'], g['weight_decay']) for g in self.optimizer.param_groups])
         self.post_prob = Post_Prob(args.sigma,
                                    args.crop_size,
                                    args.downsample_ratio,
@@ -99,17 +114,24 @@ class RegTrainer(Trainer):
         self.best_mse = np.inf
         self.save_all = args.save_all
         self.best_count = 0
+        self.best_epoch = None
 
     def train(self):
         """training process"""
-        args = self.args
-        for epoch in range(self.start_epoch, args.max_epoch):
-            logging.info('-'*5 + 'Epoch {}/{}'.format(epoch, args.max_epoch - 1) + '-'*5)
+        for epoch in progress_bar(range(self.start_epoch, self.max_epoch), desc=self.stage, unit="epoch", dynamic_ncols=True):
+            logging.info('-'*5 + 'Epoch {}/{}'.format(epoch, self.max_epoch - 1) + '-'*5)
             self.epoch = epoch
             # self.val_epoch()
             self.train_eopch()
-            if epoch % args.val_epoch == 0 and epoch >= args.val_start:
+            if epoch % self.val_interval == 0 and epoch >= self.val_start:
                 self.val_epoch()
+
+        if self.best_epoch is None:
+            logging.info('%s finished without validation; no best model selected in this run.', self.stage)
+        else:
+            logging.info('%s best result: epoch=%d, MAE=%.4f, RMSE=%.4f, score (2*RMSE+MAE)=%.4f',
+                         self.stage, self.best_epoch, self.best_mae, self.best_mse,
+                         2 * self.best_mse + self.best_mae)
 
     def train_eopch(self):
         epoch_loss = AverageMeter()
@@ -119,7 +141,9 @@ class RegTrainer(Trainer):
         self.model.train()  # Set model to training mode
 
         # Iterate over data.
-        for step, (inputs, points, targets, st_sizes) in enumerate(self.dataloaders['train']):
+        progress = progress_bar(self.dataloaders['train'], desc=f'{self.stage} epoch {self.epoch} train',
+                        unit='batch', leave=False, dynamic_ncols=True)
+        for step, (inputs, points, targets, st_sizes) in enumerate(progress):
             inputs = inputs.to(self.device)
             st_sizes = st_sizes.to(self.device)
             gd_count = np.array([len(p) for p in points], dtype=np.float32)
@@ -149,6 +173,8 @@ class RegTrainer(Trainer):
                 epoch_loss.update(loss.item(), N)
                 epoch_mse.update(np.mean(res * res), N)
                 epoch_mae.update(np.mean(abs(res)), N)
+                progress.set_postfix(loss=f'{epoch_loss.get_avg():.3f}',
+                                     mae=f'{epoch_mae.get_avg():.3f}')
 
         logging.info('Epoch {} Train, Loss: {:.2f}, MSE: {:.2f} MAE: {:.2f}, Cost {:.1f} sec'
                      .format(self.epoch, epoch_loss.get_avg(), np.sqrt(epoch_mse.get_avg()), epoch_mae.get_avg(),
@@ -168,7 +194,9 @@ class RegTrainer(Trainer):
         self.model.eval()  # Set model to evaluate mode
         epoch_res = []
         # Iterate over data.
-        for inputs, count, name in self.dataloaders['val']:
+        for inputs, count, name in progress_bar(self.dataloaders['val'],
+                                       desc=f'{self.stage} epoch {self.epoch} val',
+                                       unit='image', leave=False, dynamic_ncols=True):
             inputs = inputs.to(self.device)
             # inputs are images with different sizes
             b, c, h, w = inputs.shape
@@ -217,6 +245,7 @@ class RegTrainer(Trainer):
         logging.info("best mse {:.2f} mae {:.2f}".format(self.best_mse, self.best_mae))
         if (2.0 * mse + mae) < (2.0 * self.best_mse + self.best_mae):
             self.best_mse = mse
+            self.best_epoch = self.epoch
             self.best_mae = mae
             logging.info("save best mse {:.2f} mae {:.2f} model epoch {}".format(self.best_mse,
                                                                                  self.best_mae,
