@@ -67,7 +67,11 @@ class LearnableGlobalLocalMultiheadAttention(nn.Module):
         weight = weight[start:end, :]
         if bias is not None:
             bias = bias[start:end]
-        return F.linear(input, weight, bias)
+        output = F.linear(input, weight, bias)
+        index = str(start // self.embed_dim)
+        if hasattr(self, 'lora_in') and index in self.lora_in:
+            output = output + self.lora_in[index](input)
+        return output
 
 
 

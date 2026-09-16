@@ -2,7 +2,7 @@ import torch
 import os
 import numpy as np
 from datasets.crowd import Crowd
-from models.vgg_c import vgg19_trans
+from models.lora import build_model, checkpoint_parts
 import argparse
 import math
 
@@ -29,11 +29,11 @@ if __name__ == '__main__':
                                              num_workers=8, pin_memory=False)
 
     device = torch.device('cuda')
-    model = vgg19_trans()
+    state, config = checkpoint_parts(torch.load(args.save_dir, map_location='cpu'))
+    model, _ = build_model(state, config)
     model.to(device)
     model.eval()
 
-    model.load_state_dict(torch.load(args.save_dir, device))
     epoch_minus = []
     for inputs, count, name in dataloader:
         inputs = inputs.to(device)

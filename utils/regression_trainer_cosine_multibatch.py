@@ -26,6 +26,18 @@ def train_collate(batch):
     return images, points, targets, st_sizes
 
 
+def resolve_data_dirs(args, model_config):
+    """Choose training/validation roots by stage; either root may contain any domain."""
+    if model_config.get('lora'):
+        parent = os.path.dirname(os.path.normpath(args.data_dir))
+        train_root = args.train_dir or os.path.join(parent, 'hazy')
+        val_root = args.val_dir or os.path.join(parent, 'mix')
+        return {'train': os.path.join(train_root, 'train'),
+                'val': os.path.join(val_root, 'val')}
+    return {'train': os.path.join(args.data_dir, 'train'),
+            'val': os.path.join(args.data_dir, 'val')}
+
+
 class RegTrainer(Trainer):
     def setup(self):
         """initial the datasets, model, loss and optimizer"""
@@ -39,11 +51,21 @@ class RegTrainer(Trainer):
         else:
             raise Exception("gpu is not available")
 
+        from models.lora import build_training_model
+        self.model, self.model_config, checkpoint = build_training_model(args)
         self.downsample_ratio = args.downsample_ratio
-        self.datasets = {x: Crowd(os.path.join(args.data_dir, x),
+        data_dirs = resolve_data_dirs(args, self.model_config)
+        logging.info('Dataset stage: %s', 'LoRA' if self.model_config.get('lora') else 'clean pretrain')
+        for split, path in data_dirs.items():
+            logging.info('%s dataset: %s', split, os.path.abspath(path))
+        self.datasets = {x: Crowd(data_dirs[x],
                                   args.crop_size,
                                   args.downsample_ratio,
                                   args.is_gray, x) for x in ['train', 'val']}
+        for split, dataset in self.datasets.items():
+            if len(dataset) == 0:
+                raise ValueError(f'No .jpg images found for {split}: {data_dirs[split]}')
+            logging.info('%s images: %d', split, len(dataset))
         self.dataloaders = {x: DataLoader(self.datasets[x],
                                           collate_fn=(train_collate
                                                       if x == 'train' else default_collate),
@@ -53,21 +75,16 @@ class RegTrainer(Trainer):
                                           num_workers=args.num_workers*self.device_count,
                                           pin_memory=(True if x == 'train' else False))
                             for x in ['train', 'val']}
-        # self.model = getattr(models, args.model_name)()
-        self.model = vgg.vgg19_trans()
         self.model.to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = optim.Adam(trainable, lr=args.lr, weight_decay=args.weight_decay)
+        logging.info('Trainable parameters: %d / %d; model config: %s',
+                     sum(p.numel() for p in trainable),
+                     sum(p.numel() for p in self.model.parameters()), self.model_config)
         self.start_epoch = 0
-        if args.resume:
-            suf = args.resume.rsplit('.', 1)[-1]
-            if suf == 'tar':
-                checkpoint = torch.load(args.resume, self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                self.start_epoch = checkpoint['epoch'] + 1
-            elif suf == 'pth':
-                self.model.load_state_dict(torch.load(args.resume, self.device))
+        if checkpoint is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.start_epoch = checkpoint['epoch'] + 1
 
         self.post_prob = Post_Prob(args.sigma,
                                    args.crop_size,
@@ -141,6 +158,7 @@ class RegTrainer(Trainer):
         torch.save({
             'epoch': self.epoch,
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'model_config': self.model_config,
             'model_state_dict': model_state_dic
         }, save_path)
         self.save_list.append(save_path)  # control the number of saved models
@@ -204,10 +222,10 @@ class RegTrainer(Trainer):
                                                                                  self.best_mae,
                                                                                  self.epoch))
             if self.save_all:
-                torch.save(model_state_dic, os.path.join(self.save_dir, 'best_model_{}.pth'.format(self.best_count)))
+                torch.save({'model_state_dict': model_state_dic, 'model_config': self.model_config}, os.path.join(self.save_dir, 'best_model_{}.pth'.format(self.best_count)))
                 self.best_count += 1
             else:
-                torch.save(model_state_dic, os.path.join(self.save_dir, 'best_model.pth'))
+                torch.save({'model_state_dict': model_state_dic, 'model_config': self.model_config}, os.path.join(self.save_dir, 'best_model.pth'))
 
 
 

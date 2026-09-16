@@ -9,13 +9,12 @@ __all__ = ['vgg19_trans']
 model_urls = {'vgg19': 'https://download.pytorch.org/models/vgg19-dcbb9e9d.pth'}
 
 class VGG_Trans(nn.Module):
-    def __init__(self, features):
+    def __init__(self, features, num_layers=4):
         super(VGG_Trans, self).__init__()
         self.features = features
 
         d_model = 512
         nhead = 2
-        num_layers = 2
         dim_feedforward = 2048
         dropout = 0.1
         activation = "relu"
@@ -69,10 +68,11 @@ cfg = {
     'E': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512, 'M']
 }
 
-def vgg19_trans():
+def vgg19_trans(num_layers=4, pretrained=True):
     """VGG 19-layer model (configuration "E")
         model pre-trained on ImageNet
     """
-    model = VGG_Trans(make_layers(cfg['E']))
-    model.load_state_dict(model_zoo.load_url(model_urls['vgg19']), strict=False)
+    model = VGG_Trans(make_layers(cfg['E']), num_layers=num_layers)
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url(model_urls['vgg19']), strict=False)
     return model

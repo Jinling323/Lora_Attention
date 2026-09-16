@@ -1,4 +1,4 @@
-from utils.regression_trainer_cosine import RegTrainer
+from utils.regression_trainer_cosine_multibatch import RegTrainer
 import argparse
 import os
 import torch
@@ -7,8 +7,12 @@ args = None
 def parse_args():
     parser = argparse.ArgumentParser(description='Train ')
     parser.add_argument('--model-name', default='vgg19_trans', help='the name of the model')
-    parser.add_argument('--data-dir', default=r'E:\Dataset\Counting\UCF-Train-Val-Test',
-                        help='training data directory')
+    parser.add_argument('--data-dir', default='/media/mmslab5090/SSD2/crowd counting test/sha/clean',
+                        help='clean pretraining root containing train/ and val/')
+    parser.add_argument('--train-dir', default='/media/mmslab5090/SSD2/crowd counting test/sha/hazy',
+                        help='LoRA training root containing train/; empty value falls back to hazy/ beside data-dir')
+    parser.add_argument('--val-dir', default='/media/mmslab5090/SSD2/crowd counting test/sha/mix',
+                        help='LoRA validation root containing val/; empty value falls back to mix/ beside data-dir')
     parser.add_argument('--save-dir', default='model',
                         help='directory to save models.')
     parser.add_argument('--save-all', type=bool, default=False,
@@ -18,7 +22,7 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=1e-5,
                         help='the weight decay')
     parser.add_argument('--resume', default='',
-                        help='the path of resume training model')
+                        help='.pth: baseline for new LoRA fine-tuning; .tar: continue training')
     parser.add_argument('--max-model-num', type=int, default=1,
                         help='max models num to save ')
     parser.add_argument('--max-epoch', type=int, default=1200,
@@ -46,7 +50,18 @@ def parse_args():
                         help='sigma for likelihood')
     parser.add_argument('--background-ratio', type=float, default=0.15,
                         help='background ratio')
+    parser.add_argument('--lora', action='store_true', help='fine-tune only LoRA adapters')
+    parser.add_argument('--lora-rank', type=int, default=8)
+    parser.add_argument('--lora-alpha', type=float, default=8.0)
+    parser.add_argument('--lora-attention', choices=['all', 'qv'], default='all')
+    parser.add_argument('--num-layers', type=int, default=4, help='encoder blocks; checkpoint depth must match')
     args = parser.parse_args()
+    if args.resume and os.path.splitext(args.resume)[1].lower() not in ('.pth', '.tar'):
+        parser.error('--resume must be a .pth or .tar file')
+    if args.lora and not args.resume:
+        parser.error('--lora requires --resume with a complete checkpoint')
+    if args.lora_rank <= 0 or args.num_layers <= 0:
+        parser.error('rank and num-layers must be positive')
     return args
 
 
